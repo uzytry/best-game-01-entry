@@ -1,47 +1,44 @@
-// The few numbers the game keeps between visits: best score, best wave, wins and
-// the mute setting. Everything is wrapped so a browser with storage off (a private
-// window) just plays without remembering, instead of throwing.
+// Best-run records in localStorage: score, wave, wins and kills. All access is
+// guarded — private windows and disabled storage just mean the records last
+// this visit only.
+const KEY = 'emberfall.best.v1';
 
-import { BEST_KEY, BEST_WAVE_KEY, MUTED_KEY, WINS_KEY } from './config.js';
-
-function readInt(key) {
+export function readBest() {
   try {
-    const value = Number.parseInt(window.localStorage.getItem(key) ?? '0', 10);
-    return Number.isFinite(value) ? value : 0;
+    const raw = window.localStorage.getItem(KEY);
+    if (!raw) return { score: 0, wave: 0, wins: 0, kills: 0 };
+    const parsed = JSON.parse(raw);
+    return {
+      score: Number(parsed.score) || 0,
+      wave: Number(parsed.wave) || 0,
+      wins: Number(parsed.wins) || 0,
+      kills: Number(parsed.kills) || 0,
+    };
   } catch {
-    return 0;
+    return { score: 0, wave: 0, wins: 0, kills: 0 };
   }
 }
 
-function writeInt(key, value) {
+export function saveBest(best) {
   try {
-    window.localStorage.setItem(key, String(value));
+    window.localStorage.setItem(KEY, JSON.stringify(best));
   } catch {
-    // Storage off: the value lasts this visit only.
+    // Storage unavailable: ignore.
   }
 }
 
-export function readRecords() {
-  return {
-    best: readInt(BEST_KEY),
-    bestWave: readInt(BEST_WAVE_KEY),
-    wins: readInt(WINS_KEY),
-    muted: readInt(MUTED_KEY) === 1,
-  };
-}
-
-export function saveBest(score) {
-  writeInt(BEST_KEY, score);
-}
-
-export function saveBestWave(wave) {
-  writeInt(BEST_WAVE_KEY, wave);
-}
-
-export function saveWins(wins) {
-  writeInt(WINS_KEY, wins);
+export function readMuted() {
+  try {
+    return window.localStorage.getItem('emberfall.muted.v1') === '1';
+  } catch {
+    return false;
+  }
 }
 
 export function saveMuted(muted) {
-  writeInt(MUTED_KEY, muted ? 1 : 0);
+  try {
+    window.localStorage.setItem('emberfall.muted.v1', muted ? '1' : '0');
+  } catch {
+    // Ignore.
+  }
 }

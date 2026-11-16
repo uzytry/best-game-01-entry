@@ -1,236 +1,258 @@
-// The gloom-spawn: five kinds with their own behaviour, plus the wave-10 boss.
-// Each enemy is a plain object; update() steers it by kind, and the world reads
-// the events it returns (shots are fired straight into the shared bullet pool).
-// Spawns arrive at the field's edge, never near the Keeper.
+// The Ashen: eight enemy kinds, each with its own way of hunting. Most chase
+// the Warden; some make for the Heart instead, so the player must watch two
+// fronts at once. Elites are bigger, tougher and richer in XP.
+import { WALL, WORLD } from './config.js';
+import { addFloater, spawnBurst } from './particles.js';
+import { dropLoot } from './pickups.js';
+import { registerKill } from './combo.js';
 
-import { BOSS, ELITE, ENEMY_BULLET, ENEMY_KINDS, FIELD, scaleForWave, SPAWN_CLEAR } from './config.js';
+export const ENEMY_DEFS = {
+  emberling: { hp: 22, speed: 105, radius: 13, damage: 9, mass: 1, color: '#c792ff', shape: 'blob', heartBias: 0.3 },
+  mini: { hp: 9, speed: 150, radius: 8, damage: 6, mass: 0.6, color: '#e0aaff', shape: 'blob', heartBias: 0.2 },
+  wisp: { hp: 16, speed: 165, radius: 11, damage: 8, mass: 0.8, color: '#8ef6ff', shape: 'wisp', heartBias: 0.1 },
+  spitter: { hp: 30, speed: 82, radius: 14, damage: 8, mass: 1, color: '#a4e86a', shape: 'spitter', heartBias: 0.2 },
+  charger: { hp: 40, speed: 95, radius: 15, damage: 16, mass: 1.4, color: '#ff6b6b', shape: 'charger', heartBias: 0 },
+  splitter: { hp: 55, speed: 70, radius: 19, damage: 12, mass: 2, color: '#ffb3c1', shape: 'splitter', heartBias: 0.15 },
+  bulwark: { hp: 150, speed: 46, radius: 24, damage: 16, mass: 4.5, color: '#d8cdb4', shape: 'bulwark', heartBias: 0.35 },
+  spawner: { hp: 90, speed: 0, radius: 22, damage: 0, mass: 6, color: '#ff9f1c', shape: 'spawner', heartBias: 0 },
+  leech: { hp: 20, speed: 175, radius: 11, damage: 4, mass: 0.8, color: '#ff5d8f', shape: 'leech', heartBias: 1 },
+};
 
-function edgePoint(random, player) {
-  for (let tries = 0; tries < 12; tries += 1) {
-    const side = random.int(0, 4);
-    let x;
-    let y;
-    if (side === 0) { x = random.range(0, FIELD.width); y = -24; }
-    else if (side === 1) { x = random.range(0, FIELD.width); y = FIELD.height + 24; }
-    else if (side === 2) { x = -24; y = random.range(0, FIELD.height); }
-    else { x = FIELD.width + 24; y = random.range(0, FIELD.height); }
-    if (Math.hypot(x - player.x, y - player.y) > SPAWN_CLEAR) return { x, y };
-  }
-  return { x: FIELD.width / 2, y: -24 };
+let nextId = 1;
+
+export function spawnEnemy(state, kind, x, y, elite = false) {
+  const def = ENEMY_DEFS[kind];
+  const waveScale = 1 + (state.wave - 1) * 0.16;
+  const hp = Math.round(def.hp * waveScale * (elite ? 2.3 : 1));
+  const enemy = {
+    id: nextId,
+    kind,
+    x: Math.max(WALL + 10, Math.min(WORLD.w - WALL - 10, x)),
+    y: Math.max(WALL + 10, Math.min(WORLD.h - WALL - 10, y)),
+    vx: 0,
+    vy: 0,
+    kx: 0,
+    ky: 0,
+    hp,
+    maxHp: hp,
+    speed: def.speed * (elite ? 1.05 : 1) * state.rng.range(0.92, 1.08),
+    radius: def.radius * (elite ? 1.28 : 1),
+    damage: Math.round(def.damage * (elite ? 1.5 : 1)),
+    mass: def.mass,
+    color: def.color,
+    shape: def.shape,
+    elite,
+    boss: false,
+    target: state.rng.next() < def.heartBias ? 'heart' : 'player',
+    t: state.rng.range(0, 10),
+    attackT: state.rng.range(0.5, 1.5),
+    fireT: state.rng.range(1, 2.4),
+    spawnT: 0,
+    flash: 0,
+    slowT: 0,
+    dead: false,
+    orbitDir: state.rng.chance(0.5) ? 1 : -1,
+    charge: null,
+    children: 0,
+  };
+  nextId += 1;
+  state.enemies.push(enemy);
+  return enemy;
 }
 
-export function createEnemies(random) {
-  const list = [];
-
-  function spawn(kind, wave, elite = false) {
-    const def = ENEMY_KINDS[kind];
-    const scale = scaleForWave(wave);
-    const hp = Math.round(def.hp * scale.hp * (elite ? ELITE.hpScale : 1));
-    const radius = def.radius * (elite ? ELITE.sizeScale : 1);
-    const enemy = {
-      kind, boss: false, elite,
-      x: 0, y: 0, radius,
-      hp, maxHp: hp,
-      speed: def.speed * scale.speed * (elite ? 0.95 : 1),
-      damage: Math.round(def.damage * scale.damage),
-      score: def.score * (elite ? ELITE.scoreScale : 1),
-      orbs: def.orbs + (elite ? ELITE.orbsBonus : 0),
-      color: def.color, core: def.core,
-      kx: 0, ky: 0, wobble: random.next() * Math.PI * 2,
-      state: 'chase', timer: 0, fireTimer: 1 + random.next(),
-      lungeX: 0, lungeY: 0, flash: 0, sparkCooldown: 0,
-    };
-    return enemy;
+export function spawnAtEdge(state, kind, elite = false) {
+  const side = state.rng.int(0, 3);
+  const m = WALL + 30;
+  let x;
+  let y;
+  if (side === 0) {
+    x = state.rng.range(m, WORLD.w - m);
+    y = m;
+  } else if (side === 1) {
+    x = state.rng.range(m, WORLD.w - m);
+    y = WORLD.h - m;
+  } else if (side === 2) {
+    x = m;
+    y = state.rng.range(m, WORLD.h - m);
+  } else {
+    x = WORLD.w - m;
+    y = state.rng.range(m, WORLD.h - m);
   }
-
-  function spawnBoss(wave) {
-    const scale = scaleForWave(wave);
-    const hp = Math.round(BOSS.hp * scale.hp);
-    return {
-      kind: 'boss', boss: true, elite: false,
-      x: FIELD.width / 2, y: -80, radius: BOSS.radius,
-      hp, maxHp: hp,
-      speed: BOSS.speed, damage: BOSS.damage, score: BOSS.score, orbs: BOSS.orbs,
-      color: BOSS.color, core: BOSS.core,
-      kx: 0, ky: 0, wobble: 0,
-      state: 'enter', timer: 0,
-      radialTimer: 2.5, spreadTimer: 1.5, summonTimer: 6, chargeTimer: 5,
-      lungeX: 0, lungeY: 0, flash: 0, sparkCooldown: 0,
-    };
+  // Never spawn on top of the player.
+  if (Math.hypot(x - state.player.x, y - state.player.y) < 240) {
+    x = WORLD.w - x;
+    y = WORLD.h - y;
   }
+  return spawnEnemy(state, kind, x, y, elite);
+}
 
-  // Steer one enemy for a step. `spawn` queues a new enemy (boss summons, splitter
-  // children); the world drains the queue after the update so the list never grows
-  // while it is being walked.
-  function steer(enemy, dt, player, bullets, spawnQueue) {
-    const dx = player.x - enemy.x;
-    const dy = player.y - enemy.y;
-    const distance = Math.hypot(dx, dy) || 1;
-    const ux = dx / distance;
-    const uy = dy / distance;
-    enemy.wobble += dt * 3;
+// One wound: damage, knockback, hit flash, a floating number, and death.
+export function damageEnemy(state, enemy, amount, kx = 0, ky = 0, crit = false) {
+  if (enemy.dead) return;
+  const dmg = Math.max(1, Math.round(amount));
+  const hpBefore = enemy.hp;
+  enemy.hp -= dmg;
+  enemy.flash = 0.09;
+  enemy.kx += kx / Math.max(1, enemy.mass);
+  enemy.ky += ky / Math.max(1, enemy.mass);
+  if (enemy.slowOnHit) enemy.slowT = Math.max(enemy.slowT, 0.8);
+  // Stats count real wounds, not the kill-all's 99999.
+  state.stats.damageDealt += Math.min(dmg, hpBefore);
+  if (dmg < 10000) {
+    addFloater(state, enemy.x + state.rng.range(-8, 8), enemy.y - enemy.radius - 6, String(dmg), crit ? '#ffd166' : '#f5e9d3', crit);
+  }
+  if (enemy.hp <= 0) killEnemy(state, enemy);
+}
+
+export function killEnemy(state, enemy) {
+  if (enemy.dead) return;
+  enemy.dead = true;
+  state.kills += 1;
+  registerKill(state, enemy);
+  const base = enemy.boss ? 500 : enemy.elite ? 50 : 10;
+  state.score += Math.round(base * state.combo.mult);
+  spawnBurst(state, enemy.x, enemy.y, enemy.boss ? 40 : enemy.elite ? 18 : 9, enemy.color, enemy.boss ? 380 : 240, 0.6, enemy.boss ? 5 : 3);
+  if (state.audio) state.audio.explode(enemy.boss || enemy.elite);
+  if (enemy.kind === 'splitter') {
+    for (let i = 0; i < 2; i += 1) {
+      spawnEnemy(state, 'mini', enemy.x + state.rng.range(-16, 16), enemy.y + state.rng.range(-16, 16));
+    }
+  }
+  if (enemy.boss) state.onBossDeath(enemy);
+  else dropLoot(state, enemy);
+}
+
+function targetPoint(state, enemy) {
+  return enemy.target === 'heart' ? state.heart : state.player;
+}
+
+function seek(state, enemy, dt, speedMul = 1) {
+  const t = targetPoint(state, enemy);
+  const dx = t.x - enemy.x;
+  const dy = t.y - enemy.y;
+  const d = Math.hypot(dx, dy) || 1;
+  const slow = enemy.slowT > 0 ? 0.55 : 1;
+  const global = state.enemySpeedMul || 1;
+  enemy.vx = (dx / d) * enemy.speed * speedMul * slow * global;
+  enemy.vy = (dy / d) * enemy.speed * speedMul * slow * global;
+}
+
+export function updateEnemies(state, dt) {
+  const player = state.player;
+  for (const enemy of state.enemies) {
+    if (enemy.dead) continue;
+    enemy.t += dt;
     if (enemy.flash > 0) enemy.flash -= dt;
-    if (enemy.sparkCooldown > 0) enemy.sparkCooldown -= dt;
-
-    const wobbleX = Math.cos(enemy.wobble) * 0.25;
-    const wobbleY = Math.sin(enemy.wobble * 1.3) * 0.25;
-
-    if (enemy.kind === 'darter') {
-      enemy.timer -= dt;
-      if (enemy.state === 'chase') {
-        enemy.x += (ux + wobbleX * 0.4) * enemy.speed * dt;
-        enemy.y += (uy + wobbleY * 0.4) * enemy.speed * dt;
-        if (enemy.timer <= 0 && distance < 320) {
-          enemy.state = 'windup';
-          enemy.timer = 0.45;
-        }
-      } else if (enemy.state === 'windup') {
-        enemy.flash = 0.1;
-        if (enemy.timer <= 0) {
-          enemy.state = 'lunge';
-          enemy.timer = 0.32;
-          enemy.lungeX = ux;
-          enemy.lungeY = uy;
-        }
-      } else if (enemy.state === 'lunge') {
-        enemy.x += enemy.lungeX * 520 * dt;
-        enemy.y += enemy.lungeY * 520 * dt;
-        if (enemy.timer <= 0) {
-          enemy.state = 'recover';
-          enemy.timer = 0.6;
-        }
-      } else if (enemy.timer <= 0) {
-        enemy.state = 'chase';
-        enemy.timer = 1.2 + random.next() * 1.2;
+    if (enemy.slowT > 0) enemy.slowT -= dt;
+    enemy.attackT -= dt;
+    if (enemy.boss) {
+      state.updateBoss(enemy, dt);
+    } else if (enemy.kind === 'spawner') {
+      enemy.vx = 0;
+      enemy.vy = 0;
+      enemy.spawnT -= dt;
+      if (enemy.spawnT <= 0 && enemy.children < 4) {
+        enemy.spawnT = 4;
+        enemy.children += 1;
+        spawnEnemy(state, 'emberling', enemy.x + state.rng.range(-30, 30), enemy.y + state.rng.range(-30, 30));
       }
     } else if (enemy.kind === 'spitter') {
-      // Keep a shooting band around the Keeper: close in when far, back off when near.
-      let mx = ux;
-      let my = uy;
-      if (distance < 210) { mx = -ux; my = -uy; }
-      else if (distance < 320) { mx = -uy; my = ux; } // strafe while in range
-      enemy.x += (mx + wobbleX * 0.3) * enemy.speed * dt;
-      enemy.y += (my + wobbleY * 0.3) * enemy.speed * dt;
-      enemy.fireTimer -= dt;
-      if (enemy.fireTimer <= 0 && distance < 520) {
-        enemy.fireTimer = 2.3;
-        bullets.fireEnemy(enemy.x, enemy.y, Math.atan2(dy, dx), 190, enemy.damage, ENEMY_BULLET.life, ENEMY_BULLET.radius);
+      const t = targetPoint(state, enemy);
+      const d = Math.hypot(t.x - enemy.x, t.y - enemy.y);
+      if (d > 300) seek(state, enemy, dt, 1);
+      else if (d < 200) seek(state, enemy, dt, -0.8);
+      else {
+        enemy.vx *= 0.9;
+        enemy.vy *= 0.9;
       }
-    } else if (enemy.kind === 'boss') {
-      steerBoss(enemy, dt, player, bullets, spawnQueue, ux, uy, distance);
+      enemy.fireT -= dt;
+      if (enemy.fireT <= 0 && d < 560) {
+        enemy.fireT = 2.3;
+        const a = Math.atan2(t.y - enemy.y, t.x - enemy.x);
+        state.ebullets.push({
+          x: enemy.x,
+          y: enemy.y,
+          vx: Math.cos(a) * 230,
+          vy: Math.sin(a) * 230,
+          damage: enemy.damage,
+          radius: 5,
+          life: 4,
+          color: '#a4e86a',
+          hurtsHeart: enemy.target === 'heart',
+        });
+      }
+    } else if (enemy.kind === 'wisp') {
+      const t = targetPoint(state, enemy);
+      const d = Math.hypot(t.x - enemy.x, t.y - enemy.y);
+      const orbit = d > 150 ? 1 : -0.4;
+      const a = Math.atan2(enemy.y - t.y, enemy.x - t.x) + enemy.orbitDir * dt * 1.6;
+      const wantX = t.x + Math.cos(a) * 150;
+      const wantY = t.y + Math.sin(a) * 150;
+      const dx = wantX - enemy.x;
+      const dy = wantY - enemy.y;
+      const dd = Math.hypot(dx, dy) || 1;
+      const global = state.enemySpeedMul || 1;
+      enemy.vx = (dx / dd) * enemy.speed * orbit * global;
+      enemy.vy = (dy / dd) * enemy.speed * orbit * global;
+    } else if (enemy.kind === 'charger') {
+      if (!enemy.charge) {
+        const d = Math.hypot(player.x - enemy.x, player.y - enemy.y);
+        seek(state, enemy, dt, 1);
+        if (d < 260 && enemy.attackT <= 0) {
+          enemy.charge = { t: 0.6, angle: Math.atan2(player.y - enemy.y, player.x - enemy.x) };
+        }
+      } else if (enemy.charge.t > 0) {
+        // Telegraph: brake and count down.
+        enemy.charge.t -= dt;
+        enemy.vx *= 0.8;
+        enemy.vy *= 0.8;
+        if (enemy.charge.t <= 0) {
+          enemy.vx = Math.cos(enemy.charge.angle) * 620;
+          enemy.vy = Math.sin(enemy.charge.angle) * 620;
+          enemy.charge.t = -0.45;
+        }
+      } else {
+        // Dashing: keep the velocity until the dash window ends.
+        enemy.charge.t -= dt;
+        if (enemy.charge.t < -0.45) {
+          enemy.charge = null;
+          enemy.attackT = 1.6;
+        }
+      }
     } else {
-      enemy.x += (ux + wobbleX * 0.35) * enemy.speed * dt;
-      enemy.y += (uy + wobbleY * 0.35) * enemy.speed * dt;
+      // Emberling, mini, splitter, bulwark, leech: straight seek with a
+      // sinusoidal strafe so the swarm never marches in lockstep.
+      seek(state, enemy, dt, 1);
+      const wob = Math.sin(enemy.t * 3 + enemy.id) * 20;
+      const pl = Math.hypot(enemy.vx, enemy.vy) || 1;
+      enemy.vx += (-enemy.vy / pl) * wob * 0.25;
+      enemy.vy += (enemy.vx / pl) * wob * 0.25;
     }
-
-    // Knockback decays; brutes shrug most of it off, the boss all of it.
-    const resist = enemy.kind === 'brute' ? 0.3 : enemy.boss ? 0 : 1;
-    enemy.x += enemy.kx * resist * dt;
-    enemy.y += enemy.ky * resist * dt;
-    const decay = Math.pow(0.001, dt);
-    enemy.kx *= decay;
-    enemy.ky *= decay;
-  }
-
-  function steerBoss(boss, dt, player, bullets, spawnQueue, ux, uy, distance) {
-    const phase2 = boss.hp < boss.maxHp / 2;
-    boss.timer -= dt;
-    if (boss.state === 'enter') {
-      boss.y += 60 * dt;
-      if (boss.y >= 120) {
-        boss.state = 'fight';
-        boss.timer = 0;
-      }
-      return;
+    // Knockback decays; position integrates velocity + knockback.
+    enemy.kx *= Math.max(0, 1 - 6 * dt);
+    enemy.ky *= Math.max(0, 1 - 6 * dt);
+    enemy.x += (enemy.vx + enemy.kx) * dt;
+    enemy.y += (enemy.vy + enemy.ky) * dt;
+    enemy.x = Math.max(WALL + enemy.radius, Math.min(WORLD.w - WALL - enemy.radius, enemy.x));
+    enemy.y = Math.max(WALL + enemy.radius, Math.min(WORLD.h - WALL - enemy.radius, enemy.y));
+    // Contact with the player.
+    const dp = Math.hypot(player.x - enemy.x, player.y - enemy.y);
+    if (dp < player.radius + enemy.radius && enemy.attackT <= 0 && enemy.kind !== 'spawner') {
+      enemy.attackT = 0.8;
+      state.hurtPlayer(enemy.damage, enemy.x, enemy.y);
     }
-    if (boss.state === 'chargeWindup') {
-      boss.flash = 0.1;
-      if (boss.timer <= 0) {
-        boss.state = 'charging';
-        boss.timer = BOSS.chargeTime;
-        boss.lungeX = ux;
-        boss.lungeY = uy;
-      }
-      return;
-    }
-    if (boss.state === 'charging') {
-      boss.x += boss.lungeX * BOSS.chargeSpeed * dt;
-      boss.y += boss.lungeY * BOSS.chargeSpeed * dt;
-      if (boss.timer <= 0) {
-        boss.state = 'fight';
-        boss.chargeTimer = BOSS.chargeInterval;
-      }
-      return;
-    }
-
-    // Drift toward the Keeper, slowly, while the attacks run on their own timers.
-    boss.x += ux * boss.speed * dt;
-    boss.y += uy * boss.speed * dt;
-    boss.radialTimer -= dt;
-    boss.spreadTimer -= dt;
-    boss.summonTimer -= dt;
-    boss.chargeTimer -= dt;
-
-    if (boss.radialTimer <= 0) {
-      boss.radialTimer = phase2 ? BOSS.radialInterval * 0.7 : BOSS.radialInterval;
-      const offset = random.next() * Math.PI * 2;
-      for (let i = 0; i < BOSS.radialCount; i += 1) {
-        const angle = offset + (i * Math.PI * 2) / BOSS.radialCount;
-        bullets.fireEnemy(boss.x, boss.y, angle, BOSS.radialSpeed, 10, ENEMY_BULLET.life, ENEMY_BULLET.radius);
-      }
-    }
-    if (boss.spreadTimer <= 0) {
-      boss.spreadTimer = phase2 ? BOSS.spreadInterval * 0.7 : BOSS.spreadInterval;
-      const base = Math.atan2(player.y - boss.y, player.x - boss.x);
-      for (let i = 0; i < BOSS.spreadCount; i += 1) {
-        const angle = base + (i - (BOSS.spreadCount - 1) / 2) * 0.16;
-        bullets.fireEnemy(boss.x, boss.y, angle, BOSS.spreadSpeed, 12, ENEMY_BULLET.life, ENEMY_BULLET.radius);
-      }
-    }
-    if (boss.summonTimer <= 0) {
-      boss.summonTimer = BOSS.summonInterval;
-      for (let i = 0; i < BOSS.summonCount; i += 1) {
-        spawnQueue.push({ kind: phase2 ? 'darter' : 'wisp', x: boss.x, y: boss.y });
-      }
-    }
-    if (phase2 && boss.chargeTimer <= 0 && distance > 140) {
-      boss.state = 'chargeWindup';
-      boss.timer = 0.6;
+    // Contact with the Heart.
+    const dh = Math.hypot(state.heart.x - enemy.x, state.heart.y - enemy.y);
+    if (dh < state.heart.radius + enemy.radius && enemy.attackT <= 0 && enemy.target === 'heart') {
+      enemy.attackT = enemy.kind === 'leech' ? 0.5 : 1.3;
+      const dmg = enemy.kind === 'leech' ? 2 : enemy.damage;
+      if (state.damageHeart(dmg)) state.heartDead = true;
+      if (state.audio) state.audio.heartHit();
+      spawnBurst(state, enemy.x, enemy.y, 4, '#ff8a3c', 140, 0.3, 2.5);
     }
   }
-
-  return {
-    list,
-    spawnAtEdge(kind, wave, player) {
-      const point = edgePoint(random, player);
-      const elite = wave >= ELITE.fromWave && random.chance(ELITE.chance);
-      const enemy = spawn(kind, wave, elite);
-      enemy.x = point.x;
-      enemy.y = point.y;
-      list.push(enemy);
-      return enemy;
-    },
-    spawnAt(kind, wave, x, y) {
-      const enemy = spawn(kind, wave, false);
-      enemy.x = x;
-      enemy.y = y;
-      list.push(enemy);
-      return enemy;
-    },
-    spawnBoss(wave) {
-      const boss = spawnBoss(wave);
-      list.push(boss);
-      return boss;
-    },
-    update(dt, player, bullets, spawnQueue) {
-      for (const enemy of list) steer(enemy, dt, player, bullets, spawnQueue);
-    },
-    remove(enemy) {
-      const index = list.indexOf(enemy);
-      if (index !== -1) list.splice(index, 1);
-    },
-    clear() {
-      list.length = 0;
-    },
-  };
+  // Sweep the dead.
+  for (let i = state.enemies.length - 1; i >= 0; i -= 1) {
+    if (state.enemies[i].dead) state.enemies.splice(i, 1);
+  }
 }

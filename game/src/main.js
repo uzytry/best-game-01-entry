@@ -1,301 +1,252 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed
-// 1/60 s steps (several in a slow frame, none in a fast one), and the renderer
-// paints what is there. The game moves between six screens: title, play, draft,
-// paused, game over and victory.
-//
-// ?seed=N fixes the run's random pattern. ?shot=title|play|draft|victory (with
-// &seed=N) stages that scene instead of running the loop, paints it twice and
-// sets window.__shotReady for a screenshot.
-
-import { FIELD, STEP } from './config.js';
+// EMBERFALL — Last Spark of the Forge. Entry point: boots the world, runs the
+// fixed-step loop, switches screens, and wires sounds to world events. With
+// ?shot=<name> it stages one deterministic frame instead of a live game.
+import { STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_BOSS, EVENT_GAME_OVER, EVENT_LEVEL_UP, EVENT_REVIVED, EVENT_VICTORY } from './world.js';
-import { ACTION_CONFIRM, ACTION_DASH, ACTION_MUTE, ACTION_ONE, ACTION_PAUSE, ACTION_RESTART, ACTION_THREE, ACTION_TWO, createInput } from './input.js';
+import { createWorld, EV_HIT, EV_LEVEL, EV_OVER, EV_WIN } from './world.js';
 import { createRenderer } from './render.js';
+import {
+  ACTION_CONFIRM,
+  ACTION_DRAFT1,
+  ACTION_DRAFT2,
+  ACTION_DRAFT3,
+  ACTION_MUTE,
+  ACTION_PAUSE,
+  ACTION_RESTART,
+  createInput,
+} from './input.js';
 import { createAudio } from './audio.js';
-import { readRecords, saveBest, saveBestWave, saveMuted, saveWins } from './storage.js';
-import { SCREEN_DRAFT, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_VICTORY, drawDraft, drawGameOver, drawPaused, drawTitle, drawVictory, hitButton } from './screens.js';
-import { stageShot } from './shots.js';
-
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+import { readBest, readMuted, saveBest, saveMuted } from './storage.js';
+import { drawDraft, drawOver, drawPause, drawTitle, drawVictory } from './screens.js';
+import { runAttract, stageShot } from './shots.js';
 
 const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const seed = Number(params.get('seed')) || 7;
+const shotName = params.get('shot');
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
+const ctx = canvas.getContext('2d');
+const audio = createAudio();
 const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas, seed);
-const records = readRecords();
+world.state.audio = audio;
+const renderer = createRenderer(canvas);
+const input = createInput(canvas);
+let best = readBest();
+let isBest = false;
+audio.setMuted(readMuted());
 
-// A few wisps drifting behind the title screen, placed with the run's seed.
-const moteRandom = createRandom((seed ^ 0x51ed) >>> 0);
-const MOTES = ['#8f7bff', '#4dd8ff', '#ff7ad9', '#7dffb0', '#ffb14d'].map((color) => ({
-  color,
-  x: moteRandom.next() * FIELD.width,
-  y: 80 + moteRandom.next() * (FIELD.height - 160),
-  speed: 8 + moteRandom.next() * 14,
-  phase: moteRandom.next() * Math.PI * 2,
-}));
+let screen = 'title';
+let prevQ = false;
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  // The staged records a fresh player would carry: no best yet, so a victory
-  // shows its NEW BEST star the way a first win would.
-  const shotRecords = { best: 0, bestWave: 0, wins: 0 };
-  let painted = 0;
-  function paint() {
-    const time = world.time + 5;
-    if (scene.screen === SCREEN_TITLE) {
-      renderer.drawAmbient(time, MOTES);
-      drawTitle(ctxOf(), shotRecords, null, time);
-    } else if (scene.screen === SCREEN_DRAFT) {
-      renderer.drawWorld(world, time);
-      renderer.drawHUD(world, shotRecords);
-      drawDraft(ctxOf(), world, null);
-    } else if (scene.screen === SCREEN_VICTORY) {
-      renderer.drawWorld(world, time);
-      drawVictory(ctxOf(), world, shotRecords, true, null);
-    } else if (scene.screen === SCREEN_OVER) {
-      renderer.drawWorld(world, time);
-      // The staged loss beats a fresh player's best of 0 only if it scored.
-      drawGameOver(ctxOf(), world, shotRecords, world.score > 0, null);
-    } else {
-      renderer.drawWorld(world, time);
-      renderer.drawHUD(world, shotRecords);
-    }
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+function drawFrame() {
+  renderer.draw(world.state, screen, best, isBest);
+  if (screen === 'title') drawTitle(ctx, world.state, best, world.state.time);
+  else if (screen === 'draft') drawDraft(ctx, world.state);
+  else if (screen === 'pause') drawPause(ctx, world.state);
+  else if (screen === 'over') drawOver(ctx, world.state, best, isBest);
+  else if (screen === 'win') drawVictory(ctx, world.state, best, isBest);
+}
+
+function startRun() {
+  audio.unlock();
+  audio.click();
+  isBest = false;
+  world.reset();
+  world.state.phase = 'play';
+  screen = 'play';
+  audio.setWave(1);
+}
+
+function toTitle() {
+  world.reset();
+  world.state.phase = 'play'; // attract mode: the world lives behind the title
+  screen = 'title';
+}
+
+function finishRun() {
+  const state = world.state;
+  const won = state.phase === 'win';
+  isBest = state.score > best.score && state.score > 0;
+  best = {
+    score: Math.max(best.score, state.score),
+    wave: Math.max(best.wave, state.wave),
+    wins: best.wins + (won ? 1 : 0),
+    kills: Math.max(best.kills, state.kills),
+  };
+  saveBest(best);
+  screen = won ? 'win' : 'over';
+  if (won) {
+    audio.waveClear();
+    audio.levelup();
+  } else {
+    audio.roar();
   }
-  requestAnimationFrame(paint);
 }
 
-function ctxOf() {
-  return canvas.getContext('2d');
+// Draft card geometry — must match screens.js drawDraft.
+function draftCardAt(x, y) {
+  if (!world.state.draft) return -1;
+  const cardW = 250;
+  const cardH = 300;
+  const gap = 30;
+  const n = world.state.draft.choices.length;
+  const x0 = 640 - (n * cardW + (n - 1) * gap) / 2;
+  const y0 = 210;
+  if (y < y0 || y > y0 + cardH) return -1;
+  for (let i = 0; i < n; i += 1) {
+    const cx = x0 + i * (cardW + gap);
+    if (x >= cx && x <= cx + cardW) return i;
+  }
+  return -1;
 }
 
-function runGame() {
-  const input = createInput(canvas);
-  const audio = createAudio(records.muted);
-  let screen = SCREEN_TITLE;
-  let buttons = [];
-  let accumulator = 0;
+// ---- Shot mode: stage one deterministic frame and stop. ----
+if (shotName) {
+  try {
+    const result = stageShot(shotName, world);
+    screen = result.screen;
+    if (screen === 'win' || screen === 'over') {
+      isBest = true;
+      best = {
+        score: world.state.score,
+        wave: world.state.wave,
+        wins: screen === 'win' ? 1 : 0,
+        kills: world.state.kills,
+      };
+    }
+    drawFrame();
+    window.__shotReady = true;
+    window.__shotInfo = {
+      shot: shotName,
+      screen,
+      wave: world.state.wave,
+      score: world.state.score,
+      kills: world.state.kills,
+      level: world.state.level,
+      boons: world.state.boons.length,
+      enemies: world.state.enemies.length,
+      time: Math.round(world.state.time * 10) / 10,
+    };
+  } catch (err) {
+    window.__shotError = String(err && err.message ? err.message : err);
+    window.__shotReady = true;
+  }
+} else {
+  // ---- Live game. ----
+  toTitle();
   let last = performance.now();
-  let isNewBest = false;
-  let runBestWave = 1;
+  let acc = 0;
+  let prevShots = 0;
+  let prevPickups = 0;
+  let prevDashes = 0;
+  let prevNovas = 0;
+  let prevWave = 1;
+  let prevBoss = false;
+  let prevPlayerHp = world.state.player.hp;
+  let prevHeartHp = world.state.heart.hp;
 
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    audio.unlock();
-    world.reset();
-    runBestWave = 1;
-    isNewBest = false;
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    audio.waveStart();
-    announce('Playing. Wave 1. Survive ten waves.');
-  }
-
-  function finishRun(won) {
-    runBestWave = Math.max(runBestWave, world.wave);
-    if (world.score > records.best) {
-      isNewBest = true;
-      records.best = world.score;
-      saveBest(world.score);
+  function playStepSounds(events) {
+    const state = world.state;
+    if (state.stats.shots > prevShots) audio.shoot(state.player.weapon);
+    if (state.stats.pickups > prevPickups) audio.pickup();
+    if (state.stats.dashes > prevDashes) audio.dash();
+    if (state.stats.novas > prevNovas) audio.nova();
+    if (state.player.hp < prevPlayerHp) audio.hurt();
+    if (state.heart.hp < prevHeartHp) audio.heartHit();
+    if (state.wave > prevWave) {
+      audio.waveClear();
+      audio.setWave(state.wave);
     }
-    if (runBestWave > records.bestWave) {
-      records.bestWave = runBestWave;
-      saveBestWave(runBestWave);
-    }
-    if (won) {
-      records.wins += 1;
-      saveWins(records.wins);
-      screen = SCREEN_VICTORY;
-      audio.victory();
-      announce(`Victory. Dawn breaks. Score ${world.score}.`);
-    } else {
-      screen = SCREEN_OVER;
-      audio.gameOver();
-      announce(`Game over on wave ${world.wave}. Score ${world.score}. Best ${records.best}.`);
-    }
+    if (state.boss && !prevBoss) audio.roar();
+    if (events & EV_LEVEL) audio.levelup();
+    prevShots = state.stats.shots;
+    prevPickups = state.stats.pickups;
+    prevDashes = state.stats.dashes;
+    prevNovas = state.stats.novas;
+    prevWave = state.wave;
+    prevBoss = Boolean(state.boss);
+    prevPlayerHp = state.player.hp;
+    prevHeartHp = state.heart.hp;
   }
 
-  function toggleMute() {
-    const muted = !audio.isMuted();
-    audio.setMuted(muted);
-    saveMuted(muted);
-    announce(muted ? 'Sound off.' : 'Sound on.');
-  }
-
-  function aimPoint() {
-    const aim = input.aim();
-    if (aim.seen) return { x: aim.x, y: aim.y };
-    // No mouse yet (keyboard-only play): aim at the nearest gloom-spawn.
-    let nearest = null;
-    let nearestDistance = Infinity;
-    for (const enemy of world.enemies.list) {
-      const distance = Math.hypot(enemy.x - world.player.x, enemy.y - world.player.y);
-      if (distance < nearestDistance) {
-        nearestDistance = distance;
-        nearest = enemy;
+  function handleActions() {
+    const actions = input.takeActions();
+    const click = input.takeClick();
+    const qEdge = input.cyclePressed && !prevQ;
+    prevQ = input.cyclePressed;
+    if (actions & ACTION_MUTE) {
+      const m = !audio.muted;
+      audio.setMuted(m);
+      saveMuted(m);
+    }
+    if (actions & ACTION_PAUSE) {
+      if (screen === 'play') screen = 'pause';
+      else if (screen === 'pause') screen = 'play';
+    }
+    if (actions & ACTION_RESTART) {
+      if (screen === 'play' || screen === 'pause' || screen === 'over' || screen === 'win') startRun();
+    }
+    if (qEdge && (screen === 'pause' || screen === 'over' || screen === 'win')) toTitle();
+    if (actions & ACTION_CONFIRM) {
+      audio.unlock();
+      if (screen === 'title') startRun();
+      else if (screen === 'over' || screen === 'win') startRun();
+      else if (screen === 'pause') screen = 'play';
+    }
+    if (screen === 'draft') {
+      let pick = -1;
+      if (actions & ACTION_DRAFT1) pick = 0;
+      else if (actions & ACTION_DRAFT2) pick = 1;
+      else if (actions & ACTION_DRAFT3) pick = 2;
+      else if (click) pick = draftCardAt(click.x, click.y);
+      if (pick >= 0) {
+        world.applyDraft(pick);
+        if (world.state.phase === 'play') screen = 'play';
       }
-    }
-    return nearest ? { x: nearest.x, y: nearest.y } : { x: world.player.x, y: world.player.y - 100 };
-  }
-
-  function handleEvents(events) {
-    if (events & EVENT_BOSS) {
-      audio.bossRoar();
-      announce('The Gloom Herald has come.');
-    }
-    if (events & EVENT_LEVEL_UP) {
-      world.beginDraft();
-      screen = SCREEN_DRAFT;
-      audio.levelUp();
-      announce(`Level ${world.player.level}. Choose a boon.`);
-    }
-    if (events & EVENT_REVIVED) {
-      announce('Second Wind — the dawn returns you.');
-    }
-    if (events & EVENT_VICTORY) finishRun(true);
-    else if (events & EVENT_GAME_OVER) finishRun(false);
-  }
-
-  function handleActions(actions, click) {
-    if (actions & ACTION_MUTE) toggleMute();
-    const pressed = hitButton(buttons, click);
-    if (actions & ACTION_CONFIRM) audio.unlock();
-    if (click) audio.unlock();
-
-    if (screen === SCREEN_TITLE) {
-      if ((actions & ACTION_CONFIRM) || pressed === 'start') startGame();
-      return;
-    }
-    if (screen === SCREEN_PLAY) {
-      if (actions & ACTION_PAUSE) {
-        screen = SCREEN_PAUSED;
-        announce('Paused.');
-      } else if (actions & ACTION_RESTART) {
-        startGame();
-      }
-      return;
-    }
-    if (screen === SCREEN_DRAFT) {
-      let choice = -1;
-      if (actions & ACTION_ONE) choice = 0;
-      else if (actions & ACTION_TWO) choice = 1;
-      else if (actions & ACTION_THREE) choice = 2;
-      else if (pressed && pressed.startsWith('card-')) choice = Number(pressed.slice(5));
-      if (choice >= 0 && choice < world.draftChoices.length) {
-        world.chooseDraft(choice);
-        audio.draftPick();
-        if (world.draftPending <= 0) {
-          screen = SCREEN_PLAY;
-          announce('Playing.');
-        }
-      }
-      return;
-    }
-    if (screen === SCREEN_PAUSED) {
-      if ((actions & ACTION_PAUSE) || pressed === 'resume') {
-        screen = SCREEN_PLAY;
-        announce('Playing.');
-      } else if (pressed === 'restart' || (actions & ACTION_RESTART)) {
-        startGame();
-      } else if (pressed === 'mute') {
-        toggleMute();
-      } else if (pressed === 'title') {
-        screen = SCREEN_TITLE;
-        announce('Title screen.');
-      }
-      return;
-    }
-    if (screen === SCREEN_OVER || screen === SCREEN_VICTORY) {
-      if ((actions & ACTION_RESTART) || (actions & ACTION_CONFIRM) || pressed === 'retry' || pressed === 'again') {
-        startGame();
-      } else if (pressed === 'title') {
-        screen = SCREEN_TITLE;
-        announce('Title screen.');
-      }
+    } else if (click && screen === 'title') {
+      startRun();
+    } else if (click && (screen === 'over' || screen === 'win')) {
+      startRun();
     }
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
-    const realDt = Math.min((now - last) / 1000, MAX_FRAME);
+    let dt = (now - last) / 1000;
     last = now;
-    const actions = input.takeActions();
-    const click = input.takeClick();
-    const mouse = input.aim();
-    handleActions(actions, click);
-    audio.update(realDt);
-
-    if (screen === SCREEN_PLAY) {
-      accumulator += realDt;
-      let dashQueued = Boolean(actions & ACTION_DASH);
-      while (accumulator >= STEP && screen === SCREEN_PLAY) {
-        const events = world.step(STEP, {
-          direction: input.direction(),
-          aim: aimPoint(),
-          firing: input.firing(),
-          dash: dashQueued,
-        }, audio);
-        dashQueued = false;
-        accumulator -= STEP;
-        handleEvents(events);
-        runBestWave = Math.max(runBestWave, world.wave);
+    if (dt > 0.25) dt = 0.25;
+    handleActions();
+    acc += dt;
+    let steps = 0;
+    while (acc >= STEP && steps < 5) {
+      acc -= STEP;
+      steps += 1;
+      if (screen === 'title') {
+        runAttract(world, STEP);
+      } else if (screen === 'play') {
+        const events = world.step(
+          {
+            move: input.move(),
+            aim: input.aim(),
+            dash: input.dashHeld,
+            nova: input.novaHeld,
+            weapon: input.weaponKey(),
+            cycle: input.cyclePressed,
+            draftPick: 0,
+          },
+          STEP,
+        );
+        playStepSounds(events);
+        if (events & EV_OVER || events & EV_WIN) finishRun();
+        else if (world.state.phase === 'draft') screen = 'draft';
       }
-    } else {
-      accumulator = 0;
-      // Sparks keep drifting on the end screens; the world itself is frozen.
-      if (screen === SCREEN_OVER || screen === SCREEN_VICTORY) world.particles.update(realDt);
     }
-
-    const time = world.time + now / 1000;
-    const ctx = canvas.getContext('2d');
-    if (screen === SCREEN_TITLE) {
-      renderer.drawAmbient(now / 1000, MOTES);
-      buttons = drawTitle(ctx, records, mouse, now / 1000).buttons;
-    } else if (screen === SCREEN_DRAFT) {
-      renderer.drawWorld(world, time);
-      renderer.drawHUD(world, records);
-      buttons = drawDraft(ctx, world, mouse).buttons;
-    } else if (screen === SCREEN_PAUSED) {
-      renderer.drawWorld(world, time);
-      renderer.drawHUD(world, records);
-      buttons = drawPaused(ctx, mouse, audio.isMuted()).buttons;
-    } else if (screen === SCREEN_OVER) {
-      renderer.drawWorld(world, time);
-      buttons = drawGameOver(ctx, world, records, isNewBest, mouse).buttons;
-    } else if (screen === SCREEN_VICTORY) {
-      renderer.drawWorld(world, time);
-      buttons = drawVictory(ctx, world, records, isNewBest, mouse).buttons;
-    } else {
-      renderer.drawWorld(world, time);
-      renderer.drawHUD(world, records);
-      buttons = [];
-    }
+    if (steps === 5) acc = 0;
+    drawFrame();
   }
 
-  // Leaving the tab pauses a running game rather than letting the gloom close in unseen.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
+    if (document.hidden && screen === 'play') screen = 'pause';
   });
-
-  world.reset();
-  announce('Lumen Drift. Press Space or click Begin to play.');
   requestAnimationFrame(frame);
 }
-
-if (shot) runShot(shot);
-else runGame();

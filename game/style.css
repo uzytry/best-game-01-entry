@@ -1,34 +1,27 @@
-/* Lumen Drift's page: the canvas is a fixed 1280x720 field, scaled by the
-   browser to fit the window while keeping its shape, centred on the same
-   deep indigo as the game's own sky. Nothing else on the page moves. */
-html, body {
+/* EMBERFALL page shell: the canvas fills the window while keeping its 16:9
+   shape, centred on the same near-black the game paints behind the arena. */
+* {
   margin: 0;
-  height: 100%;
-  overflow: hidden;
-  background: #070614;
+  padding: 0;
+  box-sizing: border-box;
 }
 
-.stage {
+html,
+body {
   height: 100%;
+  background: #0a060e;
+}
+
+body {
   display: flex;
   align-items: center;
   justify-content: center;
-}
-
-#game {
-  display: block;
-  width: min(100vw, calc(100vh * 16 / 9));
-  height: min(100vh, calc(100vw * 9 / 16));
-  cursor: crosshair;
-  touch-action: none;
-}
-
-/* Read aloud, never shown: the status line screen readers announce. */
-#status {
-  position: absolute;
-  width: 1px;
-  height: 1px;
   overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
+}
+
+canvas {
+  display: block;
+  width: min(100vw, 177.78vh);
+  height: min(100vh, 56.25vw);
+  box-shadow: 0 0 60px rgba(255, 138, 60, 0.12);
 }

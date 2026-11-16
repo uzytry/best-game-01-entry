@@ -1,8 +1,10 @@
-# LUMEN DRIFT — best-game-01 entry
+# EMBERFALL — Last Spark of the Forge (best-game-01 entry, v2)
 
-**Keep the last light alive.** A neon arena-survival twin-stick shooter (2D canvas, vanilla JS, zero libraries, zero network requests): the Keeper defends the last lantern against the Gloom.
+**Hold the Heart. Survive 12 waves. Slay the Hollow King.** A twin-stick arena-survival game (2D canvas, vanilla JS, zero libraries, zero network requests): the Ember Warden defends the Forge Heart at the arena centre — the run ends if the Warden dies **or** the Heart dies.
 
-WASD/arrows to drift, mouse to aim, hold click to fire bolts of light, Shift/Space to dash through danger (i-frames), Esc to pause, M to mute, R to restart. 10 waves, 5 enemy kinds (wisp, darter, spitter, brute, splitter) plus elites from wave 4, and a two-phase boss on wave 10, "The Gloom Herald". Fallen starlight becomes XP; each level-up offers a draft of 1 of 3 boons from a pool of 12 (stackable). Combo multiplier, synthesized WebAudio SFX and generative ambient music, seeded RNG (fully deterministic), 6 screens (title / play / draft / pause / game over / victory), localStorage bests and mute, and a screen-reader status line.
+WASD/arrows to move, mouse to aim, weapons fire on their own, Shift to dash (i-frames), E/Space for a Nova blast when the meter is full, 1/2/3 or Q to switch between 3 weapons (Scatter spray, piercing Lance, bursting Mortar), Esc/P to pause, M to mute, R to restart. 12 waves, 9 enemy kinds (emberling, mini, wisp, spitter, charger, splitter, bulwark, spawner, leech) plus elites, 2 bosses (Ash Tyrant on wave 6; the Hollow King on wave 12 in 3 phases), 2 objective waves (wave 4 "Kill the Spawners", wave 8 "Storm Surge" geyser hazards), and a level-up draft of 1 of 3 boons from a pool of 20 in 3 rarities. The Heart rekindles +25 HP between waves. Combo multiplier, hit-stop, deterministic screen shake, floating damage numbers, synthesized WebAudio SFX and a procedural minor-key soundtrack that follows the wave, seeded RNG (fully deterministic), 6 screens (title with live attract-mode world / play / draft / pause / game over with two causes / victory), localStorage bests and mute.
+
+An autopilot wins 6/6 fresh-process seeds (1, 3, 7, 11, 42, 99); a reckless pilot that stands still dies on wave 1 in 17s.
 
 ## Play it
 
@@ -18,15 +20,15 @@ then open http://localhost:8080.
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 ```
 
-`main.ts` copies `game/` and `screenshots/` to the output directory and writes `dossier.json` with the vendored make.fun library. The dossier is byte-identical across runs (sha256 `ec8a0a605807cec39b142815d3e27803cfc4c6ba6ed2a70356289ed1171cfb61`).
+`main.ts` copies `game/` and `screenshots/` to the output directory and writes `dossier.json` with the vendored make.fun library. The dossier is byte-identical across runs (sha256 `155b815265bac1db91d02a719bceab48c78ad3e452f7e0fd024113ccee9213aa`, 479,854 bytes; dossier text 118,596 of the 163,840 cap — all 25 source files included in full).
 
 ## Layout
 
-- `main.ts` — the hand-in program
+- `main.ts` — the hand-in program (revised twice)
 - `serve.ts` — local static server
 - `shots.json` — the 4 staged screenshot scenes (seed 7)
-- `game/` — the game: `index.html`, `style.css`, `src/` (17 modules)
-- `screenshots/` — 4 JPEGs (1280×720): play, title, draft, victory
+- `game/` — the game: `index.html`, `style.css`, `src/` (22 modules)
+- `screenshots/` — 4 JPEGs (1280×720): play (wave 11 cover), title, draft, victory
 - `vendor/makefun-game.ts` — the kit's dossier library, byte-identical
 
 ## License

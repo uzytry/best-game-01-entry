@@ -1,429 +1,211 @@
-// The world: everything that lives in the arena and how it interacts. One fixed
-// step advances the Keeper, the wave director, the enemies, the bullets, the
-// pickups and the particles, resolves every collision, and reports what happened
-// as an event bitmask the game loop reacts to (a draft to open, a wave cleared,
-// the run won or lost). The world never draws and never reads input directly —
-// it is given the input state each step, which is also what lets the screenshot
-// scenes and the playtest bot drive it.
+// The world: one state object, one fixed step, and the wiring that lets the
+// modules talk to each other without import cycles (damage, hurt, XP, nova,
+// boss hooks all hang off `state`, assigned here). The step returns an event
+// bitmask the main loop turns into screen changes and announcements.
+import { BOSS_WAVE_FINAL, OVERDRIVE_NEED, STEP, WAVES_TOTAL, xpNeed } from './config.js';
+import { createPlayer, gainXp, hurtPlayer, updatePlayer } from './player.js';
+import { createHeart, damageHeart, updateHeart } from './heart.js';
+import { createCombo, spendOverdrive, updateCombo } from './combo.js';
+import { damageEnemy, updateEnemies } from './enemies.js';
+import { updateBoss } from './bosses.js';
+import { updateBullets, updateEnemyBullets } from './bullets.js';
+import { updateParticles, spawnBurst, spawnRing } from './particles.js';
+import { clearAllEnemies, updatePickups } from './pickups.js';
+import { startWave, updateWaves } from './waves.js';
+import { updateGeysers } from './hazards.js';
+import { applyBoon, rollDraft } from './upgrades.js';
 
-import { COMBO_MAX, COMBO_WINDOW, FIELD, HEART_DROP_CHANCE, HEART_HEAL, PLAYER, POOL, WAVE_CLEAR_BONUS, WAVE_COUNT } from './config.js';
-import { createPlayer } from './player.js';
-import { createEnemies } from './enemies.js';
-import { createBullets, circlesHit } from './bullets.js';
-import { createPickups } from './pickups.js';
-import { createParticles } from './particles.js';
-import { createWaves } from './waves.js';
-import { applyBoon, BOONS, drawDraft } from './upgrades.js';
+export const EV_HIT = 1;
+export const EV_OVER = 2;
+export const EV_WIN = 4;
+export const EV_LEVEL = 8;
+export const EV_WAVE = 16;
+export const EV_NOVA = 32;
+export const EV_BOSS = 64;
 
-export const EVENT_LEVEL_UP = 1;
-export const EVENT_WAVE_CLEAR = 2;
-export const EVENT_GAME_OVER = 4;
-export const EVENT_VICTORY = 8;
-export const EVENT_BOSS = 16;
-export const EVENT_HURT = 32;
-export const EVENT_REVIVED = 64;
-
-const NOVA_RADIUS = 170;
-
-export function createWorld(random) {
-  const player = createPlayer();
-  const enemies = createEnemies(random);
-  const bullets = createBullets();
-  const pickups = createPickups(random);
-  const particles = createParticles(random);
-  const waves = createWaves(random);
-  const spawnQueue = [];
-
-  const world = {
-    player,
-    enemies,
-    bullets,
-    pickups,
-    particles,
-    waves,
-    pools: [],
-    wave: 1,
+export function createWorld(rng) {
+  const state = {
+    rng,
+    audio: null,
+    time: 0,
+    wave: 0,
+    waveTime: 0,
+    waveState: 'intro',
+    waveBanner: 0,
+    waveBonus: 0,
+    bossIntro: 0,
+    bossPhaseFlash: 0,
+    phase: 'title',
     score: 0,
     kills: 0,
-    shotsFired: 0,
-    shotsHit: 0,
-    combo: 0,
-    comboTimer: 0,
-    time: 0,
-    phase: 'fighting', // 'fighting' | 'breather' | 'won' | 'lost'
-    banner: '',
-    bannerTimer: 0,
-    hurtFlash: 0,
-    draftChoices: [],
-    draftPending: 0,
-    boonLevels: {},
+    level: 1,
+    xp: 0,
+    pendingLevels: 0,
+    draft: null,
+    boons: [],
+    takenOnce: new Set(),
+    player: createPlayer(),
+    heart: createHeart(),
+    heartRegenMul: 1,
+    heartArmor: 0,
+    heartAlarm: 0,
+    heartDead: false,
+    enemies: [],
+    bullets: [],
+    ebullets: [],
+    particles: [],
+    floaters: [],
+    rings: [],
+    pickups: [],
+    geysers: [],
+    spawnQueue: [],
+    spawnT: 0,
+    spawnInterval: 1,
+    eliteChance: 0,
     boss: null,
-
-    get comboMultiplier() {
-      return Math.min(COMBO_MAX, 1 + Math.floor(this.combo / 3));
-    },
-
-    reset() {
-      player.reset();
-      enemies.clear();
-      bullets.clear();
-      pickups.clear();
-      particles.clear();
-      this.pools.length = 0;
-      this.wave = 1;
-      this.score = 0;
-      this.kills = 0;
-      this.shotsFired = 0;
-      this.shotsHit = 0;
-      this.combo = 0;
-      this.comboTimer = 0;
-      this.time = 0;
-      this.phase = 'fighting';
-      this.banner = 'WAVE 1';
-      this.bannerTimer = 2;
-      this.hurtFlash = 0;
-      this.draftChoices = [];
-      this.draftPending = 0;
-      this.boonLevels = {};
-      this.boss = null;
-      waves.startWave(1);
-    },
-
-    // Staging for the screenshot scenes: a fresh run at a chosen wave with a
-    // chosen loadout, as if a Keeper had fought its way there. The fight that
-    // follows is played for real by the autopilot.
-    stageForShot(wave, boonIds, score, kills, time) {
-      this.reset();
-      for (const id of boonIds) {
-        const boon = BOONS.find((item) => item.id === id);
-        if (!boon) continue;
-        applyBoon(boon, player.stats, player);
-        this.boonLevels[id] = (this.boonLevels[id] ?? 0) + 1;
-      }
-      player.hp = player.stats.maxHp;
-      player.level = 1 + boonIds.length;
-      this.score = score;
-      this.kills = kills;
-      this.time = time;
-      this.wave = wave;
-      this.phase = 'fighting';
-      this.banner = wave === WAVE_COUNT ? 'THE GLOOM HERALD' : `WAVE ${wave}`;
-      this.bannerTimer = 2;
-      waves.startWave(wave);
-    },
-
-    beginDraft() {
-      this.draftChoices = drawDraft(random, this.boonLevels);
-    },
-
-    chooseDraft(index) {
-      const boon = this.draftChoices[index];
-      if (!boon) return;
-      applyBoon(boon, player.stats, player);
-      if (boon.id === 'radiance') this.score += 500;
-      else this.boonLevels[boon.id] = (this.boonLevels[boon.id] ?? 0) + 1;
-      this.draftPending -= 1;
-      if (this.draftPending > 0) this.beginDraft();
-      else this.draftChoices = [];
-    },
-
-    damageEnemy(enemy, amount, knockX = 0, knockY = 0) {
-      enemy.hp -= amount;
-      enemy.flash = 0.08;
-      enemy.kx += knockX;
-      enemy.ky += knockY;
-      particles.sparks(enemy.x, enemy.y, enemy.core, 3);
-      particles.text(enemy.x, enemy.y - enemy.radius - 6, Math.round(amount), '#ffe9a8', 13);
-    },
-
-    killEnemy(enemy) {
-      // A bolt still in flight may strike an enemy the nova already felled;
-      // the kill is only counted once, when it leaves the list.
-      if (!enemies.list.includes(enemy)) return;
-      enemies.remove(enemy);
-      this.kills += 1;
-      this.combo += 1;
-      this.comboTimer = COMBO_WINDOW;
-      const gained = enemy.score * this.comboMultiplier;
-      this.score += gained;
-      particles.text(enemy.x, enemy.y - enemy.radius - 18, `+${gained}`, '#ffd97a', 15);
-      particles.burst(enemy.x, enemy.y, enemy.color, enemy.boss ? 60 : enemy.elite ? 26 : 14, enemy.boss ? 320 : 200);
-      particles.ring(enemy.x, enemy.y, enemy.color, enemy.radius * 2.4);
-      if (enemy.boss) particles.shake(10, 0.5);
-      else if (enemy.elite) particles.shake(4, 0.2);
-      for (let i = 0; i < enemy.orbs; i += 1) pickups.dropOrb(enemy.x, enemy.y);
-      if (enemy.boss || enemy.elite) pickups.dropHeart(enemy.x, enemy.y);
-      else if (random.chance(HEART_DROP_CHANCE)) pickups.dropHeart(enemy.x, enemy.y);
-      if (enemy.kind === 'splitter') {
-        // A dying Mote-mother bursts into wisps and leaves a gloom pool behind.
-        for (let i = 0; i < 3; i += 1) {
-          const angle = (i * Math.PI * 2) / 3;
-          spawnQueue.push({ kind: 'wisp', x: enemy.x + Math.cos(angle) * 20, y: enemy.y + Math.sin(angle) * 20 });
-        }
-        this.pools.push({ x: enemy.x, y: enemy.y, radius: POOL.radius, ttl: POOL.ttl });
-      }
-    },
-
-    hurtPlayer(amount, fromX, fromY, audio) {
-      const result = player.hurt(amount);
-      if (result === false) return 0;
-      this.hurtFlash = 0.35;
-      this.combo = 0;
-      this.comboTimer = 0;
-      const dx = player.x - fromX;
-      const dy = player.y - fromY;
-      const distance = Math.hypot(dx, dy) || 1;
-      player.x += (dx / distance) * 18;
-      player.y += (dy / distance) * 18;
-      particles.burst(player.x, player.y, '#ff5d73', 16, 220);
-      particles.shake(7, 0.3);
-      if (audio) audio.hurt();
-      if (result === 'revived') {
-        particles.ring(player.x, player.y, '#ffd97a', 160);
-        return EVENT_REVIVED;
-      }
-      return EVENT_HURT;
-    },
-
-    // One fixed step. `input` is { direction, aim, firing, dash }.
-    step(dt, input, audio) {
-      let events = 0;
-      this.time += dt;
-      if (this.bannerTimer > 0) this.bannerTimer -= dt;
-      if (this.hurtFlash > 0) this.hurtFlash -= dt;
-      if (this.comboTimer > 0) {
-        this.comboTimer -= dt;
-        if (this.comboTimer <= 0) this.combo = 0;
-      }
-
-      // The Keeper moves, dashes, aims and fires.
-      const dashed = player.move(dt, input.direction, input.aim, input.dash);
-      if (dashed) {
-        particles.ring(player.x, player.y, '#9be8ff', 44);
-        if (audio) audio.dash();
-      }
-      const angles = player.fire(dt, input.firing);
-      for (const angle of angles) {
-        this.shotsFired += 1;
-        bullets.firePlayer(
-          player.x + Math.cos(angle) * (player.radius + 4),
-          player.y + Math.sin(angle) * (player.radius + 4),
-          angle, player.stats.bulletSpeed, player.stats.damage,
-          player.stats.bulletLife, PLAYER.bulletRadius, player.stats.pierce,
-        );
-      }
-      if (angles.length > 0 && audio) audio.shoot();
-
-      // Nova: a burst of light around the Keeper.
-      if (player.tickNova(dt)) {
-        const radius = NOVA_RADIUS + player.stats.novaLevel * 30;
-        const damage = 30 + player.stats.novaLevel * 25;
-        particles.ring(player.x, player.y, '#ffd97a', radius);
-        particles.shake(4, 0.2);
-        if (audio) audio.nova();
-        for (const enemy of [...enemies.list]) {
-          if (Math.hypot(enemy.x - player.x, enemy.y - player.y) < radius + enemy.radius) {
-            this.damageEnemy(enemy, damage);
-            if (enemy.hp <= 0) this.killEnemy(enemy);
-          }
-        }
-      }
-
-      // Orbiting sparks sear what they touch (each enemy at most every 0.35 s).
-      for (const spark of player.orbiterPositions()) {
-        for (const enemy of [...enemies.list]) {
-          if (enemy.sparkCooldown > 0) continue;
-          if (circlesHit(spark.x, spark.y, 14, enemy.x, enemy.y, enemy.radius)) {
-            enemy.sparkCooldown = 0.35;
-            this.damageEnemy(enemy, 10 + player.stats.damage * 0.5);
-            if (enemy.hp <= 0) this.killEnemy(enemy);
-          }
-        }
-      }
-
-      // The director: spawns, the boss, the breather between waves.
-      if (this.phase === 'fighting') {
-        const spawn = waves.update(dt, this.wave, enemies.list.length);
-        if (spawn === 'boss') {
-          this.boss = enemies.spawnBoss(this.wave);
-          this.banner = 'THE GLOOM HERALD';
-          this.bannerTimer = 2.5;
-          events |= EVENT_BOSS;
-        } else if (spawn) {
-          enemies.spawnAtEdge(spawn, this.wave, player);
-        }
-      } else if (this.phase === 'breather') {
-        waves.update(dt, this.wave, 0);
-        if (waves.breatherLeft <= 0) {
-          this.wave += 1;
-          this.phase = 'fighting';
-          this.banner = this.wave === WAVE_COUNT ? 'THE GLOOM HERALD' : `WAVE ${this.wave}`;
-          this.bannerTimer = 2;
-          waves.startWave(this.wave);
-          if (audio) audio.waveStart();
-        }
-      }
-
-      enemies.update(dt, player, bullets, spawnQueue);
-      while (spawnQueue.length > 0) {
-        const queued = spawnQueue.shift();
-        enemies.spawnAt(queued.kind, this.wave, queued.x, queued.y);
-      }
-
-      // Soft separation so the horde does not collapse into one stack.
-      const list = enemies.list;
-      for (let i = 0; i < list.length; i += 1) {
-        for (let j = i + 1; j < list.length; j += 1) {
-          const a = list[i];
-          const b = list[j];
-          if (a.boss || b.boss) continue;
-          const dx = b.x - a.x;
-          const dy = b.y - a.y;
-          const distance = Math.hypot(dx, dy);
-          const min = a.radius + b.radius;
-          if (distance > 0 && distance < min) {
-            const push = ((min - distance) / 2) * 0.5;
-            const ux = dx / distance;
-            const uy = dy / distance;
-            a.x -= ux * push;
-            a.y -= uy * push;
-            b.x += ux * push;
-            b.y += uy * push;
-          }
-        }
-      }
-
-      bullets.update(dt, FIELD);
-
-      // Bolts against the gloom.
-      for (const bullet of [...bullets.player]) {
-        let consumed = false;
-        for (const enemy of [...enemies.list]) {
-          if (bullet.hit.has(enemy)) continue;
-          if (circlesHit(bullet.x, bullet.y, bullet.radius, enemy.x, enemy.y, enemy.radius)) {
-            this.shotsHit += 1;
-            bullet.hit.add(enemy);
-            const kx = (bullet.vx / PLAYER.bulletSpeed) * 160;
-            const ky = (bullet.vy / PLAYER.bulletSpeed) * 160;
-            this.damageEnemy(enemy, bullet.damage, kx, ky);
-            if (audio) audio.enemyHit();
-            if (enemy.hp <= 0) {
-              if (audio) audio.enemyDie();
-              const wasBoss = enemy.boss;
-              this.killEnemy(enemy);
-              if (wasBoss) {
-                this.boss = null;
-                this.phase = 'won';
-                // The remaining gloom dissolves in the dawn: a last burst each,
-                // no score — the victory is the Herald's fall, not the mop-up.
-                for (const leftover of [...enemies.list]) {
-                  particles.burst(leftover.x, leftover.y, leftover.color, 12, 200);
-                  enemies.remove(leftover);
-                }
-                bullets.clear();
-                events |= EVENT_VICTORY;
-              }
-            }
-            if (bullet.pierce > 0) {
-              bullet.pierce -= 1;
-            } else {
-              consumed = true;
-              break;
-            }
-          }
-        }
-        if (consumed) {
-          const index = bullets.player.indexOf(bullet);
-          if (index !== -1) bullets.player.splice(index, 1);
-        }
-      }
-
-      // Enemy orbs against the Keeper.
-      for (const bullet of [...bullets.enemy]) {
-        if (circlesHit(bullet.x, bullet.y, bullet.radius, player.x, player.y, player.radius)) {
-          const index = bullets.enemy.indexOf(bullet);
-          if (index !== -1) bullets.enemy.splice(index, 1);
-          events |= this.hurtPlayer(bullet.damage, bullet.x, bullet.y, audio);
-        }
-      }
-
-      // Contact with the gloom.
-      for (const enemy of [...enemies.list]) {
-        if (circlesHit(enemy.x, enemy.y, enemy.radius, player.x, player.y, player.radius)) {
-          events |= this.hurtPlayer(enemy.damage, enemy.x, enemy.y, audio);
-          // The enemy recoils a little so one touch is not a dozen.
-          enemy.x -= (player.x - enemy.x) * 0.1;
-          enemy.y -= (player.y - enemy.y) * 0.1;
-        }
-      }
-
-      // Gloom pools burn while the Keeper stands in them.
-      for (let i = this.pools.length - 1; i >= 0; i -= 1) {
-        const pool = this.pools[i];
-        pool.ttl -= dt;
-        if (pool.ttl <= 0) {
-          this.pools.splice(i, 1);
-          continue;
-        }
-        if (Math.hypot(player.x - pool.x, player.y - pool.y) < pool.radius && player.invulnerable <= 0) {
-          player.hp -= POOL.dps * dt;
-          this.hurtFlash = Math.max(this.hurtFlash, 0.15);
-          if (player.hp <= 0 && player.stats.secondWind && !player.secondWindUsed) {
-            player.secondWindUsed = true;
-            player.hp = Math.floor(player.stats.maxHp / 2);
-            player.invulnerable = 2;
-            events |= EVENT_REVIVED;
-          }
-        }
-      }
-
-      // Pickups: starlight orbs and hearts.
-      pickups.update(dt, player, player.stats.magnetRadius);
-      for (let i = pickups.orbs.length - 1; i >= 0; i -= 1) {
-        const orb = pickups.orbs[i];
-        if (circlesHit(orb.x, orb.y, 8, player.x, player.y, player.radius + 6)) {
-          pickups.orbs.splice(i, 1);
-          const gained = player.gainXp(orb.value);
-          if (gained > 0) {
-            this.draftPending += gained;
-            events |= EVENT_LEVEL_UP;
-          }
-          particles.sparks(player.x, player.y, '#9be8ff', 2);
-          if (audio) audio.pickup(this.combo);
-        }
-      }
-      for (let i = pickups.hearts.length - 1; i >= 0; i -= 1) {
-        const heart = pickups.hearts[i];
-        if (circlesHit(heart.x, heart.y, 10, player.x, player.y, player.radius + 6)) {
-          pickups.hearts.splice(i, 1);
-          player.heal(HEART_HEAL);
-          particles.text(player.x, player.y - 24, `+${HEART_HEAL}`, '#ff8fa3', 16);
-          particles.ring(player.x, player.y, '#ff8fa3', 50);
-        }
-      }
-
-      particles.update(dt);
-
-      // The wave is cleared when the queue is spent, nothing is left alive and
-      // no splitter's children are still waiting to hatch.
-      if (this.phase === 'fighting' && waves.cleared && enemies.list.length === 0 && spawnQueue.length === 0 && this.wave < WAVE_COUNT) {
-        this.score += WAVE_CLEAR_BONUS * this.wave;
-        this.phase = 'breather';
-        this.banner = `WAVE ${this.wave} CLEARED  +${WAVE_CLEAR_BONUS * this.wave}`;
-        this.bannerTimer = 2;
-        waves.startBreather();
-        events |= EVENT_WAVE_CLEAR;
-      }
-
-      if (player.dead && this.phase !== 'won') {
-        this.phase = 'lost';
-        particles.burst(player.x, player.y, '#ffd97a', 60, 320);
-        events |= EVENT_GAME_OVER;
-      }
-
-      return events;
-    },
+    bossSpawned: false,
+    bossTimer: 0,
+    objective: null,
+    objectiveDone: false,
+    stormT: 0,
+    geyserT: 2,
+    combo: createCombo(),
+    overdrive: 0,
+    magnetT: 0,
+    slowT: 0,
+    enemySlowMul: 1,
+    orbitHitTimers: [],
+    shake: 0,
+    hitStop: 0,
+    cause: null,
+    prevDash: false,
+    prevNova: false,
+    stats: { shots: 0, hits: 0, damageDealt: 0, damageTaken: 0, dashes: 0, novas: 0, pickups: 0 },
   };
 
-  return world;
+  // Cross-module calls, wired here so no module imports another's internals.
+  state.damageEnemy = (enemy, amount, kx, ky, crit) => damageEnemy(state, enemy, amount, kx, ky, crit);
+  state.hurtPlayer = (amount, x, y) => hurtPlayer(state, amount, x, y);
+  state.gainXp = (amount) => gainXp(state, amount);
+  state.damageHeart = (amount) => damageHeart(state, amount * (1 - (state.heartArmor || 0)));
+  state.updateBoss = (boss, dt) => updateBoss(state, boss, dt);
+  state.onBossDeath = (boss) => onBossDeath(state, boss);
+  state.fireNova = (free) => fireNova(state, free);
+
+  function onBossDeath(stateInner, boss) {
+    if (boss.kind === 'king') {
+      // The final boss falls: the remaining swarm burns away and the run is won.
+      clearAllEnemies(stateInner, 99999);
+      stateInner.phase = 'win';
+      stateInner.score += Math.round(stateInner.heart.hp) * 10 + 1000;
+    } else {
+      stateInner.boss = null;
+      stateInner.waveState = 'clear';
+      stateInner.waveTime = 0;
+      stateInner.score += 100 * stateInner.wave;
+      stateInner.waveBonus = 100 * stateInner.wave;
+      if (stateInner.audio) stateInner.audio.waveClear();
+    }
+  }
+
+  function fireNova(stateInner, free) {
+    if (!free && stateInner.overdrive < OVERDRIVE_NEED) return false;
+    if (!free) spendOverdrive(stateInner);
+    stateInner.stats.novas += 1;
+    stateInner.shake = Math.max(stateInner.shake, 12);
+    stateInner.hitStop = Math.max(stateInner.hitStop, 0.06);
+    spawnRing(stateInner, stateInner.player.x, stateInner.player.y, '#ffd166', 280);
+    spawnBurst(stateInner, stateInner.player.x, stateInner.player.y, 30, '#ffd166', 420, 0.6, 4);
+    if (stateInner.audio) stateInner.audio.nova();
+    for (const enemy of stateInner.enemies) {
+      if (enemy.dead) continue;
+      const d = Math.hypot(enemy.x - stateInner.player.x, enemy.y - stateInner.player.y);
+      if (d < 280 + enemy.radius) {
+        const nx = (enemy.x - stateInner.player.x) / (d || 1);
+        const ny = (enemy.y - stateInner.player.y) / (d || 1);
+        damageEnemy(stateInner, enemy, 130, nx * 500, ny * 500);
+      }
+    }
+    stateInner.ebullets.length = 0;
+    stateInner.player.invulnT = Math.max(stateInner.player.invulnT, 0.6);
+    return true;
+  }
+
+  function reset() {
+    const fresh = createWorld(rng).state;
+    // Keep the audio handle and the RNG across resets.
+    fresh.audio = state.audio;
+    fresh.rng = state.rng;
+    Object.keys(state).forEach((k) => delete state[k]);
+    Object.assign(state, fresh);
+    state.damageEnemy = (enemy, amount, kx, ky, crit) => damageEnemy(state, enemy, amount, kx, ky, crit);
+    state.hurtPlayer = (amount, x, y) => hurtPlayer(state, amount, x, y);
+    state.gainXp = (amount) => gainXp(state, amount);
+    state.damageHeart = (amount) => damageHeart(state, amount * (1 - (state.heartArmor || 0)));
+    state.updateBoss = (boss, dt) => updateBoss(state, boss, dt);
+    state.onBossDeath = (boss) => onBossDeath(state, boss);
+    state.fireNova = (free) => fireNova(state, free);
+    startWave(state, 1);
+  }
+
+  function applyDraft(index) {
+    if (!state.draft) return;
+    const boon = state.draft.choices[index];
+    if (!boon) return;
+    applyBoon(state, boon);
+    state.pendingLevels -= 1;
+    if (state.pendingLevels > 0) {
+      state.draft = { choices: rollDraft(state.rng, state.takenOnce) };
+    } else {
+      state.draft = null;
+      state.phase = 'play';
+    }
+    if (state.audio) state.audio.levelup();
+  }
+
+  function step(input, dt) {
+    let events = 0;
+    if (state.phase !== 'play') return events;
+    if (state.hitStop > 0) {
+      state.hitStop -= dt;
+      return events;
+    }
+    state.time += dt;
+    state.enemySpeedMul = (state.slowT > 0 ? 0.5 : 1) * (state.enemySlowMul || 1);
+    const hpBefore = state.player.hp;
+    const heartBefore = state.heart.hp;
+    updatePlayer(state, input, dt);
+    updateEnemies(state, dt);
+    updateBullets(state, dt);
+    updateEnemyBullets(state, dt);
+    updatePickups(state, dt);
+    updateGeysers(state, dt);
+    updateWaves(state, dt);
+    updateHeart(state, dt);
+    updateCombo(state, dt);
+    updateParticles(state, dt);
+    if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 30);
+    if (state.waveBanner > 0) state.waveBanner -= dt;
+    if (state.bossIntro > 0) state.bossIntro -= dt;
+    if (state.bossPhaseFlash > 0) state.bossPhaseFlash -= dt;
+    if (state.player.hp < hpBefore || state.heart.hp < heartBefore) events |= EV_HIT;
+    // Death and victory.
+    if (state.player.dead || state.heartDead) {
+      state.phase = 'over';
+      state.cause = state.player.dead ? 'slain' : 'heart';
+      return events | EV_OVER;
+    }
+    if (state.phase === 'win') return events | EV_WIN;
+    // Level-up opens the draft.
+    if (state.pendingLevels > 0 && !state.draft) {
+      state.draft = { choices: rollDraft(state.rng, state.takenOnce) };
+      state.phase = 'draft';
+      return events | EV_LEVEL;
+    }
+    return events;
+  }
+
+  return { state, reset, step, applyDraft };
 }
+
+export { xpNeed, STEP, WAVES_TOTAL, BOSS_WAVE_FINAL };
